@@ -41,17 +41,21 @@ base_shoulder_y = None
 
 cap = cv2.VideoCapture(0)
 
-# Output video writer
+# Output video writer (initialized after first frame to match camera resolution)
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 recording_name = f"situp_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-out = cv2.VideoWriter(recording_name, fourcc, 20.0, (640, 480))
+out = None
 
 with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
+            
+        if out is None:
+            frame_height, frame_width = frame.shape[:2]
+            out = cv2.VideoWriter(recording_name, fourcc, 20.0, (frame_width, frame_height))
+            
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image.flags.writeable = False
         results = pose.process(image)
@@ -89,7 +93,7 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                     base_shoulder_y = shoulder_y
 
             # Sit-up detection (count partial sit-ups, avoid standing)
-            if stage == "down" and (nose[1] < base_nose_y - 0.01 or shoulder_y < base_shoulder_y - 0.0q1) and hip_angle < 170:
+            if stage == "down" and (nose[1] < base_nose_y - 0.01 or shoulder_y < base_shoulder_y - 0.01) and hip_angle < 170:
                 up_frames += 1
                 down_frames = 0
                 current_time = time.time()
@@ -116,11 +120,13 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
         cv2.imshow('Sit-Up Counter', image)
         
         # Write frame to video
-        out.write(image)
+        if out is not None:
+            out.write(image)
 
         if cv2.waitKey(10) & 0xFF == ord('q'):
             break
 
 cap.release()
-out.release()
+if out is not None:
+    out.release()
 cv2.destroyAllWindows()
