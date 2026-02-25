@@ -122,7 +122,10 @@ def get_target_muscles(exercise):
         "squats": "Quadriceps, Glutes",
         "push-ups": "Chest, Triceps, Shoulders",
         "sit-ups": "Abs, Core",
-        "lunges": "Quadriceps, Glutes, Hamstrings"
+        "lunges": "Quadriceps, Glutes, Hamstrings",
+        "bicep curls": "Biceps, Forearms",
+        "lat pulldown": "Lats, Biceps, Rear Delts",
+        "pull-ups": "Lats, Biceps, Core"
     }
     return muscle_map.get(exercise, "Multiple Muscle Groups")
 
@@ -147,10 +150,14 @@ pause_start_time = 0
 last_knee_angle = None
 movement_started = False
 movement_idle_frames = 0
-movement_threshold = 5.0  # degrees
+movement_threshold = 8.0  # degrees; higher to reduce idle noise while standing
 movement_idle_limit = 12   # frames before resetting
 wrong_suppress_until = 0.0
 last_audio_time = 0.0
+BACK_ANGLE_THRESHOLD = 140  # degrees; more lenient for forward lean
+back_bad_frames = 0
+back_bad_flag = False
+hip_ref_y = None  # standing reference hip height to filter idle arm swings
 
 # Button click handling
 mouse_x = 0
@@ -159,6 +166,48 @@ mouse_clicked = False
 show_exercise_menu = False
 exercise_menu_start_time = 0
 selected_exercise = "squats"
+
+# Consecutive counters and popup state
+consecutive_incorrect = 0
+consecutive_correct = 0
+instruction_popup_active = False
+instruction_text = ""
+success_popup_start = None
+SUCCESS_POPUP_DURATION = 3.0
+# Per-rep flag: when True this rep was already marked incorrect
+current_rep_incorrect = False
+
+def register_correct_rep(n: int = 1):
+    global counter, consecutive_correct, consecutive_incorrect, success_popup_start, current_rep_incorrect
+    # If this rep was already marked incorrect earlier, skip counting it as correct
+    if current_rep_incorrect:
+        current_rep_incorrect = False
+        consecutive_correct = 0
+        return
+    counter += n
+    consecutive_correct += 1
+    consecutive_incorrect = 0
+    if consecutive_correct >= 5:
+        success_popup_start = time.time()
+
+def register_incorrect_rep(n: int = 1):
+    global incorrect_counter, consecutive_incorrect, consecutive_correct, instruction_popup_active, instruction_text, current_rep_incorrect
+    incorrect_counter += n
+    consecutive_incorrect += 1
+    consecutive_correct = 0
+    # mark this rep incorrect so a later correct-detection won't count
+    current_rep_incorrect = True
+    if consecutive_incorrect >= 3:
+        instruction_popup_active = True
+        instruction_text = (
+            "Proper Squat Form:\n"
+            "- Aim for knee angles below ~120 degrees for full depth.\n"
+            "- Keep chest up and back neutral; avoid rounding.\n"
+            "- Drive through heels and keep knees tracking toes.\n"
+            "- Control the ascent and descent.\n\n"
+            "Learn more:\n"
+            "https://www.exrx.net/WeightExercises/Quadriceps/BWSquat"
+        )
 
 # Available exercises
 available_exercises = ["squats", "push-ups", "sit-ups", "lunges"]
@@ -265,12 +314,24 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
             right_ankle = [landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                         landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
 
+            # Get shoulders for back angle detection
+            left_shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
+                             landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
+            right_shoulder = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
+                              landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+
             # Calculate both knee angles
             left_knee_angle = calculate_angle(left_hip, left_knee, left_ankle)
             right_knee_angle = calculate_angle(right_hip, right_knee, right_ankle)
 
             # Use the leg with the smaller angle (more bent)
-            knee_angle = min(left_knee_angle, right_knee_angle)
+            use_left = left_knee_angle <= right_knee_angle
+            knee_angle = left_knee_angle if use_left else right_knee_angle
+
+            # Back angle (hip hinge): shoulder-hip-ankle
+            left_back_angle = calculate_angle(left_shoulder, left_hip, left_ankle)
+            right_back_angle = calculate_angle(right_shoulder, right_hip, right_ankle)
+            back_angle = left_back_angle if use_left else right_back_angle
 
             # Display live angles on video frame (convert normalized to pixel coordinates)
             left_knee_x = int(left_knee[0] * VIDEO_WIDTH)
@@ -285,17 +346,31 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
             cv2.putText(video_image, f"{int(right_knee_angle)}°",
                        (right_knee_x + 20, right_knee_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            # Display back angle near hip to aid debugging
+            hip_x = int((left_hip[0] if use_left else right_hip[0]) * VIDEO_WIDTH)
+            hip_y = int((left_hip[1] if use_left else right_hip[1]) * VIDEO_HEIGHT)
+            cv2.putText(video_image, f"Back {int(back_angle)}°",
+                       (hip_x + 20, hip_y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             # Squat logic
             # Correct rep: knee_angle < 120 (deep squat)
             # Incorrect rep: 120 <= knee_angle <= 165 (not deep enough)
             if not is_paused:
+                # Capture standing hip reference when upright to ignore arm-only motion
+                hip_y_current = (left_hip[1] if use_left else right_hip[1])
+                if hip_ref_y is None:
+                    hip_ref_y = hip_y_current
+                if knee_angle > 165 and not movement_started:
+                    hip_ref_y = 0.9 * hip_ref_y + 0.1 * hip_y_current  # smooth reference
+                hip_drop = hip_y_current - hip_ref_y
+
                 # detect meaningful movement
                 if last_knee_angle is None:
                     last_knee_angle = knee_angle
                 delta_angle = abs(knee_angle - last_knee_angle)
                 last_knee_angle = knee_angle
-                if delta_angle > movement_threshold or knee_angle < 150:
+                if (hip_drop > 0.035 and knee_angle < 160) or (delta_angle > movement_threshold and knee_angle < 160):
                     movement_started = True
                     movement_idle_frames = 0
                 else:
@@ -306,6 +381,25 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                         partial_down_frames = down_frames = up_frames = 0
 
                 if movement_started:
+                    # Back rounding / excessive forward lean detection
+                    if hip_drop > 0.04 and knee_angle < 150:
+                        if back_angle < BACK_ANGLE_THRESHOLD:
+                            back_bad_frames += 1
+                        else:
+                            back_bad_frames = 0
+                            back_bad_flag = False
+                        if back_bad_frames >= frame_threshold and not back_bad_flag and current_time > wrong_suppress_until:
+                            wrong_alert_start = current_time
+                            register_incorrect_rep()
+                            back_bad_flag = True
+                            wrong_suppress_until = current_time + 0.6
+                            if current_time - last_audio_time > 0.4:
+                                play_wrong_audio()
+                                last_audio_time = current_time
+                    else:
+                        back_bad_frames = 0
+                        back_bad_flag = False
+
                     if knee_angle > 168:
                         up_frames += 1
                         down_frames = 0
@@ -313,7 +407,7 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                         if up_frames >= frame_threshold:
                             if partial_rep_detected and current_time - last_rep_time > min_time_between_reps and current_time > wrong_suppress_until:
                                 wrong_alert_start = current_time
-                                incorrect_counter += 1
+                                register_incorrect_rep()
                                 wrong_suppress_until = current_time + 0.6
                                 if current_time - last_audio_time > 0.4:
                                     play_wrong_audio()
@@ -322,14 +416,14 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                             stage = "up"
                             down_frames = 0
 
-                    elif knee_angle < 120:
+                    elif knee_angle < 115 and hip_drop > 0.04:
                         # Correct depth - deep enough for a good rep
                         down_frames += 1
                         up_frames = 0
                         partial_down_frames = 0
                         if down_frames >= frame_threshold and stage == "up":
                             if current_time - last_rep_time > min_time_between_reps:
-                                counter += 1
+                                register_correct_rep()
                                 stage = "down"
                                 last_rep_time = current_time
                                 wrong_suppress_until = current_time + 0.6
@@ -342,7 +436,7 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                                 partial_down_frames = 0
                                 up_frames = down_frames = 0
 
-                    elif 120 <= knee_angle <= 168 and stage == "up":
+                    elif 115 <= knee_angle <= 160 and stage == "up" and hip_drop > 0.04:
                         # Incorrect depth - not deep enough (partial rep)
                         partial_down_frames += 1
                         down_frames = 0
@@ -574,30 +668,31 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_WHITE, 2)
 
         # === BUTTON COORDS MUST BE DEFINED BEFORE CLICK HANDLING ===
-        # Check Pause button
-        if button_coords['pause']:
-            x1, y1, x2, y2 = button_coords['pause']
-            if x1 <= mouse_x <= x2 and y1 <= mouse_y <= y2:
-                is_paused = not is_paused
-                if is_paused:
-                    pause_start_time = current_time
-                else:
-                    if pause_start_time > 0:
-                        paused_time += (current_time - pause_start_time)
-                        pause_start_time = 0
-            
-            # Check Change Exercise button
-            if button_coords['change_exercise']:
+        # Handle clicks once per mouse press to avoid repeated toggles
+        if mouse_clicked:
+            if button_coords['pause']:
+                x1, y1, x2, y2 = button_coords['pause']
+                if x1 <= mouse_x <= x2 and y1 <= mouse_y <= y2:
+                    is_paused = not is_paused
+                    if is_paused:
+                        pause_start_time = current_time
+                    else:
+                        if pause_start_time > 0:
+                            paused_time += (current_time - pause_start_time)
+                            pause_start_time = 0
+                    mouse_clicked = False
+            if mouse_clicked and button_coords['change_exercise']:
                 x1, y1, x2, y2 = button_coords['change_exercise']
                 if x1 <= mouse_x <= x2 and y1 <= mouse_y <= y2:
                     show_exercise_menu = True
                     exercise_menu_start_time = current_time
-            
-            # Check End Workout button
-            if button_coords['end_workout']:
+                    mouse_clicked = False
+            if mouse_clicked and button_coords['end_workout']:
                 x1, y1, x2, y2 = button_coords['end_workout']
                 if x1 <= mouse_x <= x2 and y1 <= mouse_y <= y2:
                     break
+            # reset any unconsumed click
+            mouse_clicked = False
 
         # Draw exercise selection menu
         if show_exercise_menu:
@@ -667,46 +762,23 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
                        (close_x + 25, close_y + 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
             
-            # Check for clicks on exercise menu
+            # Check for clicks on exercise menu (one-shot per click)
             if mouse_clicked:
-                mouse_clicked = False
-                # Check exercise options
-                for x1, y1, x2, y2, exercise in exercise_buttons:
-                    if x1 <= mouse_x <= x2 and y1 <= mouse_y <= y2:
-                        selected_exercise = exercise
-                        show_exercise_menu = False
-                        # Update current exercise display
-                        break
-                
-                # Check close button
+                # Check close button first to allow quick dismiss
                 if close_x <= mouse_x <= close_x + close_width and close_y <= mouse_y <= close_y + close_height:
                     show_exercise_menu = False
+                else:
+                    # Check exercise options
+                    for x1, y1, x2, y2, exercise in exercise_buttons:
+                        if x1 <= mouse_x <= x2 and y1 <= mouse_y <= y2:
+                            selected_exercise = exercise
+                            show_exercise_menu = False
+                            break
+                mouse_clicked = False
             
             # Auto-close menu after 10 seconds
             if current_time - exercise_menu_start_time > 10:
                 show_exercise_menu = False
-
-        # Keyboard controls
-        key = cv2.waitKey(10) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('p'):
-            is_paused = not is_paused
-            if is_paused:
-                pause_start_time = current_time
-            else:
-                if pause_start_time > 0:
-                    paused_time += (current_time - pause_start_time)
-                    pause_start_time = 0
-        elif key == ord('c'):
-            show_exercise_menu = True
-            exercise_menu_start_time = current_time
-        elif key == ord('e'):
-            break
-
-        # Show and save
-        cv2.imshow('FitMaster AI - Squat Counter', ui_image)
-        out.write(ui_image)
 
         # Display wrong rep alert (after video so it stays visible)
         if wrong_alert_start > 0 and current_time - wrong_alert_start < 3:
@@ -731,6 +803,71 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as 
             cv2.putText(ui_image, alert_text,
                        (text_x, text_y),
                        font, font_scale, COLOR_WHITE, thickness)
+
+        # Persistent instruction popup
+        def draw_persistent_instruction(img, text):
+            h, w = img.shape[:2]
+            box_w = int(w * 0.5)
+            box_h = int(h * 0.45)
+            x = (w - box_w) // 2
+            y = (h - box_h) // 2
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (50, 50, 50), -1)
+            cv2.addWeighted(overlay, 0.9, img, 0.1, 0, img)
+            cv2.putText(img, "Instruction", (x + 12, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            lines = text.split('\n')
+            ty = y + 60
+            for line in lines:
+                cv2.putText(img, line, (x + 14, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
+                ty += 26
+
+        # Success popup (auto-dismisses)
+        def draw_success_popup(img, start_time):
+            global success_popup_start
+            if start_time is None:
+                return
+            elapsed = time.time() - start_time
+            if elapsed > SUCCESS_POPUP_DURATION:
+                success_popup_start = None
+                return
+            h, w = img.shape[:2]
+            box_w = 360
+            box_h = 80
+            x = (w - box_w) // 2
+            y = 20
+            cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (0, 160, 0), -1)
+            cv2.putText(img, "Good job! Keep it up.", (x + 20, y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        if instruction_popup_active:
+            draw_persistent_instruction(ui_image, instruction_text)
+
+        if success_popup_start is not None:
+            draw_success_popup(ui_image, success_popup_start)
+
+        # Keyboard controls
+        key = cv2.waitKey(10) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('p'):
+            is_paused = not is_paused
+            if is_paused:
+                pause_start_time = current_time
+            else:
+                if pause_start_time > 0:
+                    paused_time += (current_time - pause_start_time)
+                    pause_start_time = 0
+        elif key == ord('c'):
+            show_exercise_menu = True
+            exercise_menu_start_time = current_time
+        elif key == ord('e'):
+            break
+        elif key == ord('i'):
+            instruction_popup_active = False
+            consecutive_incorrect = 0
+
+        # Show and save (after all overlays are drawn)
+        cv2.imshow('FitMaster AI - Squat Counter', ui_image)
+        out.write(ui_image)
 
 cap.release()
 out.release()

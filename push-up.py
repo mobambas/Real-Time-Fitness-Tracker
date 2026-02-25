@@ -123,7 +123,10 @@ def get_target_muscles(exercise):
         "squats": "Quadriceps, Glutes",
         "push-ups": "Chest, Triceps, Shoulders",
         "sit-ups": "Abs, Core",
-        "lunges": "Quadriceps, Glutes, Hamstrings"
+        "lunges": "Quadriceps, Glutes, Hamstrings",
+        "bicep curls": "Biceps, Forearms",
+        "lat pulldown": "Lats, Biceps, Rear Delts",
+        "pull-ups": "Lats, Biceps, Core"
     }
     return muscle_map.get(exercise, "Multiple Muscle Groups")
 
@@ -153,6 +156,48 @@ workout_start_time = time.time()
 is_paused = False
 paused_time = 0
 pause_start_time = 0
+
+# Consecutive counters and popup state
+consecutive_incorrect = 0
+consecutive_correct = 0
+instruction_popup_active = False
+instruction_text = ""
+success_popup_start = None
+SUCCESS_POPUP_DURATION = 3.0
+# Per-rep flag: when True this rep was already marked incorrect
+current_rep_incorrect = False
+
+def register_correct_rep(n: int = 1):
+    global counter, consecutive_correct, consecutive_incorrect, success_popup_start, current_rep_incorrect
+    # If this rep was already marked incorrect earlier, skip counting it as correct
+    if current_rep_incorrect:
+        current_rep_incorrect = False
+        consecutive_correct = 0
+        return
+    counter += n
+    consecutive_correct += 1
+    consecutive_incorrect = 0
+    if consecutive_correct >= 5:
+        success_popup_start = time.time()
+
+def register_incorrect_rep(n: int = 1):
+    global incorrect_counter, consecutive_incorrect, consecutive_correct, instruction_popup_active, instruction_text, current_rep_incorrect
+    incorrect_counter += n
+    consecutive_incorrect += 1
+    consecutive_correct = 0
+    # mark this rep incorrect so a later correct-detection won't count
+    current_rep_incorrect = True
+    if consecutive_incorrect >= 3:
+        instruction_popup_active = True
+        instruction_text = (
+            "Proper Push-Up Form:\n"
+            "- Keep a straight line from head to heels; avoid sagging hips.\n"
+            "- Elbow angle should come below ~95 degrees at the bottom.\n"
+            "- Maintain tight core and controlled tempo.\n"
+            "- Avoid flaring elbows excessively.\n\n"
+            "Learn more:\n"
+            "https://www.exrx.net/WeightExercises/Pectorals/BWPushup"
+        )
 
 # Button click handling
 mouse_x = 0
@@ -324,14 +369,14 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                     if up_frames >= frame_threshold:
                         # Complete rep only if we previously hit depth
                         if stage == "down" and depth_reached and (current_time - last_rep_time > min_time_between_reps):
-                            counter += 1
-                            last_rep_time = current_time
-                            play_rep_audio(counter)
-                            add_confetti(video_x + VIDEO_WIDTH // 2, video_y + VIDEO_HEIGHT // 2)
+                                register_correct_rep()
+                                last_rep_time = current_time
+                                play_rep_audio(counter)
+                                add_confetti(video_x + VIDEO_WIDTH // 2, video_y + VIDEO_HEIGHT // 2)
                         # If we never hit depth but moved back up, count an incorrect rep
                         elif partial_rep_detected and not depth_reached and (current_time - last_rep_time > min_time_between_reps):
                             wrong_alert_start = current_time
-                            incorrect_counter += 1
+                            register_incorrect_rep()
                             play_wrong_audio()
                         stage = "up"
                         depth_reached = False
@@ -358,7 +403,7 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                 # Back not straight during the movement -> incorrect rep
                 if back_bad_frames >= frame_threshold and not back_bad_flag and angle < 150:
                     wrong_alert_start = current_time
-                    incorrect_counter += 1
+                    register_incorrect_rep()
                     back_bad_flag = True
                     play_wrong_audio()
 
@@ -720,6 +765,59 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                         (text_x, text_y),
                         font, font_scale, COLOR_WHITE, thickness)
 
+        # Persistent instruction popup
+        def draw_persistent_instruction(img, text):
+            h, w = img.shape[:2]
+            box_w = int(w * 0.5)
+            box_h = int(h * 0.45)
+            x = (w - box_w) // 2
+            y = (h - box_h) // 2
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (50, 50, 50), -1)
+            cv2.addWeighted(overlay, 0.9, img, 0.1, 0, img)
+            cv2.putText(img, "Instruction", (x + 12, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            lines = text.split('\n')
+            ty = y + 60
+            for line in lines:
+                cv2.putText(img, line, (x + 14, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
+                ty += 26
+
+        # Success popup (auto-dismisses)
+        def draw_success_popup(img, start_time):
+            global success_popup_start
+            if start_time is None:
+                return
+            elapsed = time.time() - start_time
+            if elapsed > SUCCESS_POPUP_DURATION:
+                success_popup_start = None
+                return
+            h, w = img.shape[:2]
+            box_w = 360
+            box_h = 80
+            x = (w - box_w) // 2
+            y = 20
+            cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (0, 160, 0), -1)
+            cv2.putText(img, "Good job! Keep it up.", (x + 20, y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        if instruction_popup_active:
+            h, w = ui_image.shape[:2]
+            box_w = int(w * 0.5)
+            box_h = int(h * 0.45)
+            x = (w - box_w) // 2
+            y = (h - box_h) // 2
+            draw_persistent_instruction(ui_image, instruction_text)
+            close_rect = (x + box_w - 90, y + 6, x + box_w - 18, y + 28)
+            if mouse_clicked:
+                mx, my = mouse_x, mouse_y
+                if close_rect[0] <= mx <= close_rect[2] and close_rect[1] <= my <= close_rect[3]:
+                    instruction_popup_active = False
+                    consecutive_incorrect = 0
+                mouse_clicked = False
+
+        if success_popup_start is not None:
+            draw_success_popup(ui_image, success_popup_start)
+
+
         # Keyboard controls
         key = cv2.waitKey(10) & 0xFF
         if key == ord('q'):
@@ -737,6 +835,11 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
             exercise_menu_start_time = current_time
         elif key == ord('e'):
             break
+
+        # Keyboard: dismiss instruction popup with 'i'
+        if key == ord('i'):
+            instruction_popup_active = False
+            consecutive_incorrect = 0
 
         # Show and save
         cv2.imshow('FitMaster AI - Push-Up Counter', ui_image)

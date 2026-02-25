@@ -121,7 +121,10 @@ def get_target_muscles(exercise):
         "squats": "Quadriceps, Glutes",
         "push-ups": "Chest, Triceps, Shoulders",
         "sit-ups": "Abs, Core",
-        "lunges": "Quadriceps, Glutes, Hamstrings"
+        "lunges": "Quadriceps, Glutes, Hamstrings",
+        "bicep curls": "Biceps, Forearms",
+        "lat pulldown": "Lats, Biceps, Rear Delts",
+        "pull-ups": "Lats, Biceps, Core"
     }
     return muscle_map.get(exercise, "Multiple Muscle Groups")
 
@@ -155,8 +158,28 @@ back_bad_frames = 0
 back_bad_flag = False
 forward_leg_locked = None
 forward_leg_lock_frames = 0
-back_angle_threshold = 145  # allow slight lean
+back_angle_threshold = 130  # allow more tolerance for slight forward lean (less strict)
 min_vis_threshold = 0.5     # require visibility to trust back check
+
+# Calibration variables (auto-tune per user/camera)
+calibration_mode = False
+calibration_start_time = 0.0
+calibration_duration = 8.0  # seconds to collect samples
+calibration_samples_left = []
+calibration_samples_right = []
+calibrated_left_threshold = 120
+calibrated_right_threshold = 120
+calibration_min_samples = 15
+show_debug = True
+
+# Simple both-knees mode: require both knees ~90° and ignore back checks
+simple_both_knees_mode = True
+stage_both = "up"
+min_both_knee_angle = 180.0
+last_rep_time_both = 0.0
+KNEE_TARGET = 90
+KNEE_TOLERANCE = 10
+KNEE_CORRECT_THRESHOLD = KNEE_TARGET + KNEE_TOLERANCE  # e.g., <=100 counts as ~90
 
 # Button click handling
 mouse_x = 0
@@ -175,6 +198,64 @@ button_coords = {
     'change_exercise': None,
     'end_workout': None
 }
+
+# Consecutive counters and popup state (lunges have left/right counters)
+consecutive_incorrect = 0
+consecutive_correct = 0
+instruction_popup_active = False
+instruction_text = ""
+success_popup_start = None
+SUCCESS_POPUP_DURATION = 3.0
+# Per-rep flags (left/right): when True this rep was already marked incorrect
+current_rep_incorrect_left = False
+current_rep_incorrect_right = False
+def register_correct_rep(side: str):
+    global counter_left, counter_right, consecutive_correct, consecutive_incorrect, success_popup_start, current_rep_incorrect_left, current_rep_incorrect_right
+    # If this rep was already marked incorrect earlier, skip counting it as correct
+    if side == 'left' and current_rep_incorrect_left:
+        current_rep_incorrect_left = False
+        consecutive_correct = 0
+        return
+    if side == 'right' and current_rep_incorrect_right:
+        current_rep_incorrect_right = False
+        consecutive_correct = 0
+        return
+    if side == 'left':
+        counter_left += 1
+    elif side == 'right':
+        counter_right += 1
+    else:
+        return
+    consecutive_correct += 1
+    consecutive_incorrect = 0
+    if consecutive_correct >= 5:
+        success_popup_start = time.time()
+
+def register_incorrect_rep(side: str = None, n: int = 1):
+    global incorrect_counter, consecutive_incorrect, consecutive_correct, instruction_popup_active, instruction_text, current_rep_incorrect_left, current_rep_incorrect_right
+    incorrect_counter += n
+    consecutive_incorrect += 1
+    consecutive_correct = 0
+    # mark this rep incorrect so a later correct-detection won't count
+    if side == 'left':
+        current_rep_incorrect_left = True
+    elif side == 'right':
+        current_rep_incorrect_right = True
+    else:
+        # Unknown side -> mark both to be safe
+        current_rep_incorrect_left = True
+        current_rep_incorrect_right = True
+    if consecutive_incorrect >= 3:
+        instruction_popup_active = True
+        instruction_text = (
+            "Proper Lunge Form:\n"
+            "- Keep torso upright and step forward with controlled descent.\n"
+            "- Front knee should not pass far beyond toes; aim for ~90 degrees at front knee.\n"
+            "- Drive through the front heel on the way up.\n"
+            "- Keep hips square and avoid excessive forward lean.\n\n"
+            "Learn more:\n"
+            "https://www.exrx.net/WeightExercises/Quadriceps/BWLunge"
+        )
 
 def mouse_callback(event, x, y, flags, param):
     """Handle mouse events"""
@@ -351,13 +432,75 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                         forward_leg_locked = forward_leg
                 forward_leg = forward_leg_locked or forward_leg
 
+                # --- Calibration sampling: collect min knee angles during a calibration window ---
+                # Calibration mode can be toggled by pressing 't' key during runtime.
+                if calibration_mode:
+                    # collect per-side min knee angle samples while in movement
+                    if forward_leg == "Left":
+                        calibration_samples_left.append(min_left_knee_angle)
+                    elif forward_leg == "Right":
+                        calibration_samples_right.append(min_right_knee_angle)
+                    # Auto-finish calibration after duration
+                    if calibration_start_time == 0.0:
+                        calibration_start_time = current_time
+                    if current_time - calibration_start_time > calibration_duration:
+                        # compute median-ish thresholds if enough samples
+                        if len(calibration_samples_left) >= calibration_min_samples:
+                            calibrated_left_threshold = int(np.percentile(calibration_samples_left, 60))
+                        if len(calibration_samples_right) >= calibration_min_samples:
+                            calibrated_right_threshold = int(np.percentile(calibration_samples_right, 60))
+                        calibration_mode = False
+                        calibration_start_time = 0.0
+
                 # Back stability check (use forward side)
                 active_back_angle = left_back_angle if forward_leg == "Left" else right_back_angle if forward_leg == "Right" else min(left_back_angle, right_back_angle)
 
                 # Process left-forward case
                 if not is_paused:
                     rep_event = False
-                    if forward_leg == "Left":
+                    # Simple both-knees detection: user requested both knees ~90°, no back checks
+                    if simple_both_knees_mode:
+                        # update running min of both knees
+                        min_both_knee_angle = min(min_both_knee_angle, left_knee_angle, right_knee_angle)
+                        # detect descent
+                        if stage_both == "up":
+                            if left_knee_angle < 140 or right_knee_angle < 140:
+                                stage_both = "down"
+                        elif stage_both == "down":
+                            # when returning up (both knees extended) consider rep completion
+                            if left_knee_angle > 160 and right_knee_angle > 160:
+                                if current_time - last_rep_time_both > min_time_between_reps:
+                                    # correct if both knees reached near-target
+                                    if min_both_knee_angle <= KNEE_CORRECT_THRESHOLD:
+                                        # alternate side labeling so UI keeps left/right counts
+                                        side = 'left' if ((counter_left + counter_right) % 2 == 0) else 'right'
+                                        register_correct_rep(side)
+                                        last_rep_time_both = current_time
+                                        wrong_suppress_until = current_time + 0.8
+                                        if current_time - last_audio_time > 0.35:
+                                            play_rep_audio(counter_left if side == 'left' else counter_right)
+                                            last_audio_time = current_time
+                                        add_confetti(video_x + VIDEO_WIDTH // 2, video_y + VIDEO_HEIGHT // 2)
+                                        rep_event = True
+                                    else:
+                                        if current_time - last_wrong_alert_time > min_time_between_wrong_alerts and current_time > wrong_suppress_until:
+                                            wrong_alert_start = current_time
+                                            register_incorrect_rep()
+                                            last_wrong_alert_time = current_time
+                                            wrong_suppress_until = current_time + 0.8
+                                            if current_time - last_audio_time > 0.35:
+                                                play_wrong_audio()
+                                                last_audio_time = current_time
+                                            rep_event = True
+                                stage_both = "up"
+                                min_both_knee_angle = 180.0
+                        # reset per-side frame counters to avoid accidental triggers
+                        left_down_frames = 0
+                        right_down_frames = 0
+                        left_up_frames = 0
+                        right_up_frames = 0
+                    # Process left-forward case
+                    elif not simple_both_knees_mode and forward_leg == "Left":
                         # LEFT leg is forward: handle left leg states first
                         # Down detection
                         if stage_left == "up":
@@ -383,8 +526,11 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                                 if left_up_frames >= frame_threshold:
                                     # complete rep
                                     if current_time - last_rep_time_left > min_time_between_reps:
-                                        if min_left_knee_angle < 100:
-                                            counter_left += 1
+                                        # Relaxed threshold: count as correct if knee reaches roughly <=120 degrees
+                                        # Use calibrated threshold if available
+                                        left_threshold = calibrated_left_threshold if calibrated_left_threshold is not None else 120
+                                        if min_left_knee_angle <= left_threshold:
+                                            register_correct_rep('left')
                                             last_rep_time_left = current_time
                                             wrong_suppress_until = current_time + 0.8
                                             if current_time - last_audio_time > 0.35:
@@ -393,10 +539,11 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                                             # Add confetti on successful rep
                                             add_confetti(video_x + VIDEO_WIDTH // 2, video_y + VIDEO_HEIGHT // 2)
                                             rep_event = True
-                                        elif 110 <= min_left_knee_angle < 150:
+                                        # Shallow lunge: mark incorrect but with a wider acceptance band
+                                        elif left_threshold < min_left_knee_angle < 160:
                                             if current_time - last_wrong_alert_time > min_time_between_wrong_alerts and current_time > wrong_suppress_until:
                                                 wrong_alert_start = current_time
-                                                incorrect_counter += 1
+                                                register_incorrect_rep('left')
                                                 last_wrong_alert_time = current_time
                                                 wrong_suppress_until = current_time + 0.8
                                                 if current_time - last_audio_time > 0.35:
@@ -414,7 +561,7 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                         right_up_frames = 0
 
                     # Process right-forward case
-                    elif forward_leg == "Right":
+                    elif not simple_both_knees_mode and forward_leg == "Right":
                         if stage_right == "up":
                             if right_knee_angle < 160:
                                 right_down_frames += 1
@@ -436,8 +583,11 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                                 right_up_frames += 1
                                 if right_up_frames >= frame_threshold:
                                     if current_time - last_rep_time_right > min_time_between_reps:
-                                        if min_right_knee_angle < 100:
-                                            counter_right += 1
+                                        # Relaxed threshold: count as correct if knee reaches roughly <=120 degrees
+                                        # Use calibrated threshold if available
+                                        right_threshold = calibrated_right_threshold if calibrated_right_threshold is not None else 120
+                                        if min_right_knee_angle <= right_threshold:
+                                            register_correct_rep('right')
                                             last_rep_time_right = current_time
                                             wrong_suppress_until = current_time + 0.8
                                             if current_time - last_audio_time > 0.35:
@@ -446,10 +596,11 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                                             # Add confetti on successful rep
                                             add_confetti(video_x + VIDEO_WIDTH // 2, video_y + VIDEO_HEIGHT // 2)
                                             rep_event = True
-                                        elif 110 <= min_right_knee_angle < 150:
+                                        # Shallow lunge: mark incorrect but with a wider acceptance band
+                                        elif right_threshold < min_right_knee_angle < 160:
                                             if current_time - last_wrong_alert_time > min_time_between_wrong_alerts and current_time > wrong_suppress_until:
                                                 wrong_alert_start = current_time
-                                                incorrect_counter += 1
+                                                register_incorrect_rep('right')
                                                 last_wrong_alert_time = current_time
                                                 wrong_suppress_until = current_time + 0.8
                                                 if current_time - last_audio_time > 0.35:
@@ -466,25 +617,19 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                         left_down_frames = 0
                         left_up_frames = 0
 
-                    else:
+                    elif not simple_both_knees_mode:
                         # No clear forward leg: reset frame counters to avoid false triggers
                         left_down_frames = 0
                         right_down_frames = 0
                         left_up_frames = 0
                         right_up_frames = 0
-                        # If knees are flexing without clear forward leg, mark incorrect once
-                        if (left_knee_angle < 150 or right_knee_angle < 150) and current_time > wrong_suppress_until:
-                            wrong_alert_start = current_time
-                            incorrect_counter += 1
-                            wrong_suppress_until = current_time + 0.8
-                            if current_time - last_audio_time > 0.35:
-                                play_wrong_audio()
-                                last_audio_time = current_time
+                        # If knees are flexing without clear forward leg, be tolerant and wait
+                        # for a side-specific rep to complete before marking incorrect.
 
                 # If back stays bad for several frames during movement, flag incorrect (only when visibility is good)
                 if back_bad_frames >= (frame_threshold + 1) and not back_bad_flag and current_time > wrong_suppress_until and not rep_event:
                     wrong_alert_start = current_time
-                    incorrect_counter += 1
+                    register_incorrect_rep()  # unknown side, mark both
                     back_bad_flag = True
                     wrong_suppress_until = current_time + 0.8
                     if current_time - last_audio_time > 0.35:
@@ -731,6 +876,16 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                    (video_x + VIDEO_WIDTH - 200, video_y + 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_YELLOW, 2)
 
+        # Debug overlay: show min knee angles and calibrated thresholds
+        if show_debug:
+            debug_y = video_y + VIDEO_HEIGHT + 10
+            left_thresh_display = calibrated_left_threshold if calibrated_left_threshold is not None else 120
+            right_thresh_display = calibrated_right_threshold if calibrated_right_threshold is not None else 120
+            cv2.putText(ui_image, f"Lmin:{int(min_left_knee_angle)} T:{left_thresh_display}", (video_x + 10, debug_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
+            cv2.putText(ui_image, f"Rmin:{int(min_right_knee_angle)} T:{right_thresh_display}", (video_x + 220, debug_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
+            if calibration_mode:
+                cv2.putText(ui_image, "Calibration: ON - move through a few lunges", (video_x + 460, debug_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_YELLOW, 2)
+
         # Display wrong rep alert (after video so it stays visible)
         if wrong_alert_start > 0 and current_time - wrong_alert_start < 3:
             alert_text = "Wrong Rep! Fix Your Form"
@@ -754,6 +909,46 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
             cv2.putText(ui_image, alert_text,
                         (text_x, text_y),
                         font, font_scale, COLOR_WHITE, thickness)
+
+        # Persistent instruction popup (shows until dismissed)
+        def draw_persistent_instruction(img, text):
+            h, w = img.shape[:2]
+            box_w = int(w * 0.5)
+            box_h = int(h * 0.45)
+            x = (w - box_w) // 2
+            y = (h - box_h) // 2
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (50, 50, 50), -1)
+            cv2.addWeighted(overlay, 0.9, img, 0.1, 0, img)
+            cv2.putText(img, "Instruction", (x + 12, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            lines = text.split('\n')
+            ty = y + 60
+            for line in lines:
+                cv2.putText(img, line, (x + 14, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
+                ty += 26
+
+        # Success popup (auto-dismisses)
+        def draw_success_popup(img, start_time):
+            global success_popup_start
+            if start_time is None:
+                return
+            elapsed = time.time() - start_time
+            if elapsed > SUCCESS_POPUP_DURATION:
+                success_popup_start = None
+                return
+            h, w = img.shape[:2]
+            box_w = 360
+            box_h = 80
+            x = (w - box_w) // 2
+            y = 20
+            cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (0, 160, 0), -1)
+            cv2.putText(img, "Good job! Keep it up.", (x + 20, y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        if instruction_popup_active:
+            draw_persistent_instruction(ui_image, instruction_text)
+
+        if success_popup_start is not None:
+            draw_success_popup(ui_image, success_popup_start)
 
         # === BUTTON COORDS MUST BE DEFINED BEFORE CLICK HANDLING ===
         # ... button_coords assignment for all buttons ...
@@ -888,6 +1083,19 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
         elif key == ord('c'):
             show_exercise_menu = True
             exercise_menu_start_time = current_time
+        elif key == ord('t'):
+            # Toggle calibration mode
+            calibration_mode = not calibration_mode
+            if calibration_mode:
+                calibration_samples_left.clear()
+                calibration_samples_right.clear()
+                calibration_start_time = 0.0
+            else:
+                # if user manually turned off, compute thresholds if enough samples
+                if len(calibration_samples_left) >= calibration_min_samples:
+                    calibrated_left_threshold = int(np.percentile(calibration_samples_left, 60))
+                if len(calibration_samples_right) >= calibration_min_samples:
+                    calibrated_right_threshold = int(np.percentile(calibration_samples_right, 60))
         elif key == ord('e'):
             break
 

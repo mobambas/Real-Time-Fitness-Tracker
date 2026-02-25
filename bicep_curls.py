@@ -159,6 +159,49 @@ pause_start_time = 0.0
 wrong_suppress_until = 0.0
 last_audio_time = 0.0
 
+# Consecutive counters and popup state
+consecutive_incorrect = 0
+consecutive_correct = 0
+instruction_popup_active = False
+instruction_text = ""
+success_popup_start = None
+SUCCESS_POPUP_DURATION = 3.0
+# Per-rep flag: when True this rep was already marked incorrect
+current_rep_incorrect = False
+
+def register_correct_rep(n: int = 1):
+    global counter, consecutive_correct, consecutive_incorrect, success_popup_start, current_rep_incorrect
+    # If this rep was already marked incorrect earlier, do not count it as correct
+    if current_rep_incorrect:
+        # reset the per-rep flag for the next rep and break any correct streak
+        current_rep_incorrect = False
+        consecutive_correct = 0
+        return
+    counter += n
+    consecutive_correct += 1
+    consecutive_incorrect = 0
+    if consecutive_correct >= 5:
+        success_popup_start = time.time()
+
+def register_incorrect_rep(n: int = 1):
+    global incorrect_counter, consecutive_incorrect, consecutive_correct, instruction_popup_active, instruction_text, current_rep_incorrect
+    incorrect_counter += n
+    consecutive_incorrect += 1
+    consecutive_correct = 0
+    # mark this rep as incorrect so a later correct-detection in the same rep won't count
+    current_rep_incorrect = True
+    if consecutive_incorrect >= 3:
+        instruction_popup_active = True
+        instruction_text = (
+            "Proper Bicep Curl Form:\n"
+            "- Keep elbow stationary and tucked to your side.\n"
+            "- Elbow angle (shoulder-elbow-wrist) should go below ~50 degrees at peak contraction.\n"
+            "- Avoid swinging the torso; keep back straight and core engaged.\n"
+            "- Control both concentric and eccentric phases.\n\n"
+            "Learn more:\n"
+            "https://www.exrx.net/WeightExercises/Biceps/DBCurl"
+        )
+
 # Mouse/button handling
 mouse_x = 0
 mouse_y = 0
@@ -313,7 +356,7 @@ with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as 
                             elbow_drift_flag = False
                         if elbow_drift_frames >= frame_threshold and not elbow_drift_flag:
                             wrong_alert_start = current_time
-                            incorrect_counter += 1
+                            register_incorrect_rep()
                             elbow_drift_flag = True
                             play_wrong_audio()
 
@@ -325,7 +368,7 @@ with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as 
                         back_bad_flag = False
                     if back_bad_frames >= frame_threshold and not back_bad_flag and current_time > wrong_suppress_until:
                         wrong_alert_start = current_time
-                        incorrect_counter += 1
+                        register_incorrect_rep()
                         back_bad_flag = True
                         wrong_suppress_until = current_time + 0.6
                         if current_time - last_audio_time > 0.35:
@@ -340,7 +383,7 @@ with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as 
                             if partial_rep_detected and current_time - last_rep_time > min_time_between_reps:
                                 if current_time > wrong_suppress_until:
                                     wrong_alert_start = current_time
-                                    incorrect_counter += 1
+                                    register_incorrect_rep()
                                     wrong_suppress_until = current_time + 0.6
                                     if current_time - last_audio_time > 0.35:
                                         play_wrong_audio()
@@ -353,7 +396,8 @@ with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as 
                         partial_frames = 0
                         if up_frames >= frame_threshold and stage == "down":
                             if current_time - last_rep_time > min_time_between_reps:
-                                counter += 1
+                                # register correct rep (and possibly trigger success popup)
+                                register_correct_rep()
                                 stage = "up"
                                 last_rep_time = current_time
                                 wrong_suppress_until = current_time + 0.6
@@ -578,6 +622,61 @@ with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as 
                         (text_x, text_y),
                         font, font_scale, COLOR_WHITE, thickness)
 
+        # Persistent instruction popup (shows until closed by user action)
+        def draw_persistent_instruction(img, text):
+            h, w = img.shape[:2]
+            box_w = int(w * 0.5)
+            box_h = int(h * 0.45)
+            x = (w - box_w) // 2
+            y = (h - box_h) // 2
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (50, 50, 50), -1)
+            cv2.addWeighted(overlay, 0.9, img, 0.1, 0, img)
+            cv2.putText(img, "Instruction", (x + 12, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            lines = text.split('\n')
+            ty = y + 60
+            for line in lines:
+                cv2.putText(img, line, (x + 14, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
+                ty += 26
+
+        # Success popup (auto-dismisses)
+        def draw_success_popup(img, start_time):
+            global success_popup_start
+            if start_time is None:
+                return
+            elapsed = time.time() - start_time
+            if elapsed > SUCCESS_POPUP_DURATION:
+                success_popup_start = None
+                return
+            h, w = img.shape[:2]
+            box_w = 360
+            box_h = 80
+            x = (w - box_w) // 2
+            y = 20
+            cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (0, 160, 0), -1)
+            cv2.putText(img, "Good job! Keep it up.", (x + 20, y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        if instruction_popup_active:
+            # draw and get close-button rect
+            h, w = ui_image.shape[:2]
+            box_w = int(w * 0.5)
+            box_h = int(h * 0.45)
+            x = (w - box_w) // 2
+            y = (h - box_h) // 2
+            draw_persistent_instruction(ui_image, instruction_text)
+            close_rect = (x + box_w - 90, y + 6, x + box_w - 18, y + 28)
+            # If user clicked the Close button, dismiss
+            if mouse_clicked:
+                mx, my = mouse_x, mouse_y
+                if close_rect[0] <= mx <= close_rect[2] and close_rect[1] <= my <= close_rect[3]:
+                    instruction_popup_active = False
+                    consecutive_incorrect = 0
+                # reset click after handling
+                mouse_clicked = False
+
+        if success_popup_start is not None:
+            draw_success_popup(ui_image, success_popup_start)
+
         cv2.setMouseCallback('FitMaster AI - Bicep Curl Counter', mouse_callback)
         if mouse_clicked and not show_exercise_menu:
             mouse_clicked = False
@@ -680,6 +779,10 @@ with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as 
         key = cv2.waitKey(10) & 0xFF
         if key == ord('q') or key == ord('e'):
             break
+        # Dismiss instruction popup with 'i'
+        if key == ord('i'):
+            instruction_popup_active = False
+            consecutive_incorrect = 0
         elif key == ord('p'):
             is_paused = not is_paused
             if is_paused:
